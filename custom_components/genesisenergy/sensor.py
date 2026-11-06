@@ -1,379 +1,152 @@
 """Genesis Energy sensors."""
 
-from datetime import datetime, timedelta
+import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 import logging
-import pytz
+from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.sensor import SensorEntity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-from homeassistant.components.recorder.util import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
 )
+from homeassistant.components.recorder.util import get_instance
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
+from .api import GenesisEnergyApi
 from .const import DOMAIN, SENSOR_NAME
+from .usage import backfill_days, build_statistics, fetch_start_date, parse_start, previous_sum
 
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(hours=1)
 
+
+@dataclass(frozen=True)
+class UsageKind:
+    """Describe one Genesis Energy fuel type."""
+
+    key: str
+    icon: str
+    device_class: str
+    fetch: Callable[[GenesisEnergyApi, date, date], Awaitable[list[Any]]]
+
+
+USAGE_KINDS = (
+    UsageKind("energy", "mdi:meter-electric", "energy", GenesisEnergyApi.get_energy_usage),
+    UsageKind("gas", "mdi:fire", "gas", GenesisEnergyApi.get_gas_usage),
+)
+
+
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback, discovery_info=None
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ):
     """Set up the Genesis Energy sensor platform."""
+    async_add_entities(
+        GenesisEnergyUsageSensor(entry, entry.runtime_data, kind) for kind in USAGE_KINDS
+    )
 
-    if "api" not in hass.data[DOMAIN]:
-        _LOGGER.error("API instance not found in config entry data.")
-        return False
-
-    api = hass.data[DOMAIN]["api"]
-    async_add_entities([GenesisEnergyUsageSensor(SENSOR_NAME, api)], True)
-    async_add_entities([GenesisEnergyGasUsageSensor(SENSOR_NAME, api)], True)
 
 class GenesisEnergyUsageSensor(SensorEntity):
-    """Define Genesis Energy Usage sensor."""
+    """Import Genesis Energy hourly usage and cost into long-term statistics."""
 
-    def __init__(self, name, api):
-        """Initialize Genesis Energy Usage sensor."""
-        self._name = name
-        self._state = None
-        self._unit_of_measurement = "kWh"
-        self._currency = "NZD"
-        self._unique_id = f"{DOMAIN}_energy_usage"
-        self._device_class = "energy"
-        self._state_class = "total"
-        self._last_reset = None
-        self._state_attributes = {}
+    _attr_name = SENSOR_NAME
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_state_class = "total"
+    _attr_native_value = None
+
+    def __init__(self, entry: ConfigEntry, api: GenesisEnergyApi, kind: UsageKind) -> None:
+        """Initialize the sensor."""
+        self._entry = entry
         self._api = api
-        self._icon = "mdi:meter-electric"
-        self._consumption_sensor_id =  f"{DOMAIN}:energy_consumption_daily"
-        self._consumption_sensor_name =  f"{DOMAIN} energy_consumption_daily"
-        self._cost_sensor_id =  f"{DOMAIN}:energy_cost_daily"
-        self._cost_sensor_name =  f"{DOMAIN} energy_cost_daily"
+        self._kind = kind
+        self._lock = asyncio.Lock()
+        self._attr_unique_id = f"{DOMAIN}_{kind.key}_usage"
+        self._attr_icon = kind.icon
+        self._attr_device_class = kind.device_class
+        self._consumption_id = f"{DOMAIN}:{kind.key}_consumption_daily"
+        self._cost_id = f"{DOMAIN}:{kind.key}_cost_daily"
+        self._backfilled_key = f"backfilled_days_{kind.key}"
 
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
+    async def async_added_to_hass(self) -> None:
+        """Start the first import without blocking setup, since a backfill can take minutes."""
+        self._entry.async_create_background_task(
+            self.hass, self.async_update(), f"{DOMAIN} {self._kind.key} import"
+        )
 
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return self._icon
+    async def async_update(self) -> None:
+        """Import any new usage."""
+        if self._lock.locked():
+            return
+        async with self._lock:
+            try:
+                await self._async_import()
+            except Exception:
+                _LOGGER.exception("Failed to import Genesis %s usage", self._kind.key)
 
-    @property
-    def state(self):
-        """Return the state of the device."""
-        return None
+    async def _async_import(self) -> None:
+        history_days = backfill_days(self._entry.data, self._entry.options)
+        backfill_pending = history_days > self._entry.data.get(self._backfilled_key, 0)
+        latest = await self._async_last_stats(1)
 
-    @property
-    def extra_state_attributes(self):
-        """Return the state attributes of the sensor."""
-        return self._state_attributes
+        today = dt_util.now().date()
+        start = fetch_start_date(
+            today,
+            datetime.fromtimestamp(latest[0]["start"], tz=UTC) if latest else None,
+            history_days,
+            backfill_pending,
+        )
+        _LOGGER.debug("Fetching Genesis %s usage from %s to %s", self._kind.key, start, today)
+        usage = await self._kind.fetch(self._api, start, today)
+        if not usage:
+            _LOGGER.warning("No Genesis %s usage returned from %s", self._kind.key, start)
+            return
 
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement."""
-        return self._unit_of_measurement
+        await self._async_add_statistics(usage)
+        _LOGGER.debug("Imported %s hours of Genesis %s usage", len(usage), self._kind.key)
 
-    @property
-    def state_class(self):
-        """Return the state class."""
-        return self._state_class
+        if backfill_pending:
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, self._backfilled_key: history_days}
+            )
 
-    @property
-    def last_reset(self):
-        """Return when the total accumulated energy usage was last reset to 0."""
-        return self._last_reset
+    async def _async_last_stats(self, count: int, statistic_id: str | None = None):
+        statistic_id = statistic_id or self._consumption_id
+        result = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, count, statistic_id, True, {"sum"}
+        )
+        return result.get(statistic_id, [])
 
-    @property
-    def device_class(self):
-        """Return the device class."""
-        return self._device_class
+    async def _async_add_statistics(self, usage: list[Any]) -> None:
+        first_start = parse_start(usage[0])
+        kw_sum = previous_sum(await self._async_last_stats(200), first_start)
+        cost_sum = previous_sum(await self._async_last_stats(200, self._cost_id), first_start)
+        kw_statistics, cost_statistics = build_statistics(usage, kw_sum, cost_sum)
 
-    @property
-    def unique_id(self):
-        """Return the unique id."""
-        return self._unique_id
-
-    async def async_update(self):
-        """Update the sensor data."""
-        _LOGGER.debug("Beginning sensor update")
-        response = await self._api.get_energy_data()
-        if not response:
-          _LOGGER.warning("No sensor data available, skipping processing")
-          return
-        await self.process_data(response)
-
-    async def process_data(self, data):
-      """Process the hourly energy data."""
-      usageData = data.get('usage', [])
-      if not usageData:
-        _LOGGER.warning("No usage data available, skipping processing")
-        return
-
-      _LOGGER.debug(f"usage data: {usageData}")
-      running_sum_kw = 0
-      running_sum_costNZD = 0
-
-      cost_statistics = []
-      kw_statistics = []
-      first_start_date = datetime.fromisoformat(usageData[0]['startDate']).astimezone(pytz.utc)
-
-      # Since last_reset doesn't seem to work, fetch the previous sum total to continue from
-      previous_consumption_sensor_data = await get_instance(self.hass).async_add_executor_job(
-          get_last_statistics, self.hass, 200, self._consumption_sensor_id, True, {"sum"}
-      )
-      previous_consumption_stats = previous_consumption_sensor_data.get(self._consumption_sensor_id, [])
-
-      previous_cost_stats_sensor_data = await get_instance(self.hass).async_add_executor_job(
-          get_last_statistics, self.hass, 200, self._cost_sensor_id, True, {"sum"}
-      )
-      previous_cost_stats =previous_cost_stats_sensor_data.get(self._cost_sensor_id, [])
-
-      for stat in previous_consumption_stats:
-        statStartDate = datetime.fromtimestamp(stat['start']).astimezone(pytz.utc)
-        if statStartDate < first_start_date and stat["sum"] is not None:
-            running_sum_kw = stat["sum"]
-            break
-      for stat in previous_cost_stats:
-        statStartDate = datetime.fromtimestamp(stat['start']).astimezone(pytz.utc)
-        if statStartDate < first_start_date and stat["sum"] is not None:
-            running_sum_costNZD = stat["sum"]
-            break
-
-      _LOGGER.debug(f"previous running sum for consumption: {running_sum_kw}")
-      _LOGGER.debug(f"previous running sum for cost: {running_sum_costNZD}")
-
-      for entry in usageData:
-          running_sum_kw += entry['kw']
-          running_sum_costNZD += entry['costNZD']
-
-          cost_statistics.append(StatisticData({
-              "start": datetime.strptime(entry['startDate'], "%Y-%m-%dT%H:%M:%S%z"),
-              "state": entry['costNZD'],
-              "sum": round(running_sum_costNZD, 2),
-          }))
-
-          kw_statistics.append(StatisticData({
-              "start": datetime.strptime(entry['startDate'], "%Y-%m-%dT%H:%M:%S%z"),
-              "state": entry['kw'],
-              "sum": round(running_sum_kw, 2)
-          }))
-
-      if kw_statistics:
-          kw_metadata = StatisticMetaData(
-              has_mean= False,
-              has_sum= True,
-              name= self._consumption_sensor_name,
-              source= DOMAIN,
-              statistic_id= self._consumption_sensor_id,
-              unit_of_measurement= self._unit_of_measurement,
-          )
-          try:
-            _LOGGER.debug(f"kw statistics: {kw_statistics}")
-            async_add_external_statistics(self.hass, kw_metadata, kw_statistics)
-          except HomeAssistantError as e:
-                _LOGGER.exception(
-                    f"Failed to save statistics for {self._consumption_sensor_id}: {e}"
-                )
-                raise
-      else:
-          _LOGGER.warning("No daily energy consumption statistics found, skipping update")
-
-      if cost_statistics:
-          cost_metadata = StatisticMetaData(
-              has_mean= False,
-              has_sum= True,
-              name= self._cost_sensor_name,
-              source= DOMAIN,
-              statistic_id= self._cost_sensor_id,
-              unit_of_measurement= self._currency,
-          )
-          try:
-            _LOGGER.debug(f"Cost statistics: {cost_statistics}")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-          except HomeAssistantError as e:
-                _LOGGER.exception(
-                    f"Failed to save statistics for {self._cost_sensor_id}: {e}"
-                )
-                raise
-      else:
-          _LOGGER.warning("No daily energy cost statistics found, skipping update")
-
-
-class GenesisEnergyGasUsageSensor(SensorEntity):
-    """Define Genesis Energy Usage sensor."""
-
-    def __init__(self, name, api):
-        """Initialize Genesis Energy Gas Usage sensor."""
-        self._name = name
-        self._state = None
-        self._unit_of_measurement = "kWh"
-        self._currency = "NZD"
-        self._unique_id = f"{DOMAIN}_gas_usage"
-        self._device_class = "gas"
-        self._state_class = "total"
-        self._last_reset = None
-        self._state_attributes = {}
-        self._api = api
-        self._icon = "mdi:fire"
-        self._consumption_sensor_id =  f"{DOMAIN}:gas_consumption_daily"
-        self._consumption_sensor_name =  f"{DOMAIN} gas_consumption_daily"
-        self._cost_sensor_id =  f"{DOMAIN}:gas_cost_daily"
-        self._cost_sensor_name =  f"{DOMAIN} gas_cost_daily"
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return self._icon
-
-    @property
-    def state(self):
-        """Return the state of the device."""
-        return None
-
-    @property
-    def extra_state_attributes(self):
-        """Return the state attributes of the sensor."""
-        return self._state_attributes
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement."""
-        return self._unit_of_measurement
-
-    @property
-    def state_class(self):
-        """Return the state class."""
-        return self._state_class
-
-    @property
-    def last_reset(self):
-        """Return when the total accumulated gas usage was last reset to 0."""
-        return self._last_reset
-
-    @property
-    def device_class(self):
-        """Return the device class."""
-        return self._device_class
-
-    @property
-    def unique_id(self):
-        """Return the unique id."""
-        return self._unique_id
-
-    async def async_update(self):
-        """Update the sensor data."""
-        _LOGGER.debug("Beginning sensor update")
-        response = await self._api.get_gas_data()
-        if not response:
-          _LOGGER.warning("No sensor data available, skipping processing")
-          return
-        await self.process_data(response)
-
-    async def process_data(self, data):
-      """Process the hourly gas data."""
-      usageData = data.get('usage', [])
-      if not usageData:
-        _LOGGER.warning("No usage data available, skipping processing")
-        return
-
-      _LOGGER.debug(f"usage data: {usageData}")
-      running_sum_kw = 0
-      running_sum_costNZD = 0
-
-      cost_statistics = []
-      kw_statistics = []
-      first_start_date = datetime.fromisoformat(usageData[0]['startDate']).astimezone(pytz.utc)
-
-      # Since last_reset doesn't seem to work, fetch the previous sum total to continue from
-      previous_consumption_sensor_data = await get_instance(self.hass).async_add_executor_job(
-          get_last_statistics, self.hass, 200, self._consumption_sensor_id, True, {"sum"}
-      )
-      previous_consumption_stats = previous_consumption_sensor_data.get(self._consumption_sensor_id, [])
-
-      previous_cost_stats_sensor_data = await get_instance(self.hass).async_add_executor_job(
-          get_last_statistics, self.hass, 200, self._cost_sensor_id, True, {"sum"}
-      )
-      previous_cost_stats =previous_cost_stats_sensor_data.get(self._cost_sensor_id, [])
-
-      for stat in previous_consumption_stats:
-        statStartDate = datetime.fromtimestamp(stat['start']).astimezone(pytz.utc)
-        if statStartDate < first_start_date and stat["sum"] is not None:
-            running_sum_kw = stat["sum"]
-            break
-      for stat in previous_cost_stats:
-        statStartDate = datetime.fromtimestamp(stat['start']).astimezone(pytz.utc)
-        if statStartDate < first_start_date and stat["sum"] is not None:
-            running_sum_costNZD = stat["sum"]
-            break
-
-      _LOGGER.debug(f"previous running sum for consumption: {running_sum_kw}")
-      _LOGGER.debug(f"previous running sum for cost: {running_sum_costNZD}")
-
-      for entry in usageData:
-          running_sum_kw += entry['kw']
-          running_sum_costNZD += entry['costNZD']
-
-          cost_statistics.append(StatisticData({
-              "start": datetime.strptime(entry['startDate'], "%Y-%m-%dT%H:%M:%S%z"),
-              "state": entry['costNZD'],
-              "sum": round(running_sum_costNZD, 2),
-          }))
-
-          kw_statistics.append(StatisticData({
-              "start": datetime.strptime(entry['startDate'], "%Y-%m-%dT%H:%M:%S%z"),
-              "state": entry['kw'],
-              "sum": round(running_sum_kw, 2)
-          }))
-
-      if kw_statistics:
-          kw_metadata = StatisticMetaData(
-              has_mean= False,
-              has_sum= True,
-              name= self._consumption_sensor_name,
-              source= DOMAIN,
-              statistic_id= self._consumption_sensor_id,
-              unit_of_measurement= self._unit_of_measurement,
-          )
-          try:
-            _LOGGER.debug(f"kw statistics: {kw_statistics}")
-            async_add_external_statistics(self.hass, kw_metadata, kw_statistics)
-          except HomeAssistantError as e:
-                _LOGGER.exception(
-                    f"Failed to save statistics for {self._consumption_sensor_id}: {e}"
-                )
-                raise
-      else:
-          _LOGGER.warning("No daily gas consumption statistics found, skipping update")
-
-      if cost_statistics:
-          cost_metadata = StatisticMetaData(
-              has_mean= False,
-              has_sum= True,
-              name= self._cost_sensor_name,
-              source= DOMAIN,
-              statistic_id= self._cost_sensor_id,
-              unit_of_measurement= self._currency,
-          )
-          try:
-            _LOGGER.debug(f"Cost statistics: {cost_statistics}")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-          except HomeAssistantError as e:
-                _LOGGER.exception(
-                    f"Failed to save statistics for {self._cost_sensor_id}: {e}"
-                )
-                raise
-      else:
-          _LOGGER.warning("No daily gas cost statistics found, skipping update")
-
+        for statistic_id, unit, unit_class, statistics in (
+            (self._consumption_id, "kWh", "energy", kw_statistics),
+            (self._cost_id, "NZD", None, cost_statistics),
+        ):
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    mean_type=StatisticMeanType.NONE,
+                    has_sum=True,
+                    name=statistic_id.replace(":", " "),
+                    source=DOMAIN,
+                    statistic_id=statistic_id,
+                    unit_class=unit_class,
+                    unit_of_measurement=unit,
+                ),
+                [StatisticData(**s) for s in statistics],
+            )
