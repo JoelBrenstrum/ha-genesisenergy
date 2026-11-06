@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Genesis Energy",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "backfill_days": "Days of history to import"
+        },
+        "data_description": {
+          "backfill_days": "How far back to import hourly usage when first connected. Electricity is available for about 3 years (1095 days) and gas for about 2 years. Large imports run in the background and take a few minutes."
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Genesis Energy",
+        "data": {
+          "backfill_days": "Days of history to import"
+        },
+        "data_description": {
+          "backfill_days": "Increase this to import older history. Electricity is available for about 3 years (1095 days) and gas for about 2 years."
+        }
+      }
+    }
+  }
+}

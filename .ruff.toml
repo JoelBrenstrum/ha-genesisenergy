@@ -46,3 +46,5 @@ keep-runtime-typing = true
 
 [lint.mccabe]
 max-complexity = 25
+[lint.per-file-ignores]
+"tests/*" = ["D"]

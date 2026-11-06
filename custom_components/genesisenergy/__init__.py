@@ -1,39 +1,30 @@
 """Support for Genesis Energy sensors."""
 
-import logging
-
-from homeassistant.core import HomeAssistant
+import aiohttp
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
-from .const import DOMAIN, PLATFORMS
-from .api import GenesisEnergyApi
-
-_LOGGER = logging.getLogger(__name__)
+from .api import GenesisEnergyApi, GenesisEnergyAuthError
+from .const import PLATFORMS
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
-    email = entry.data.get("email")
-    password = entry.data.get("password")
+    api = GenesisEnergyApi(entry.data.get("email"), entry.data.get("password"))
 
-    api = GenesisEnergyApi(email, password)
+    try:
+        await api.get_refresh_token()
+    except GenesisEnergyAuthError as err:
+        raise ConfigEntryAuthFailed(str(err)) from err
+    except aiohttp.ClientError as err:
+        raise ConfigEntryNotReady(str(err)) from err
 
-    await api.get_refresh_token()
-
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-
-    hass.data[DOMAIN]["api"] = api
-
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-
+    entry.runtime_data = api
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
